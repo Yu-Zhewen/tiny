@@ -146,7 +146,7 @@ def parse_command():
       help='Path to load pretrained model for evaluation or starting point for training')
   parser.add_argument(
       '--tfl_file_name',
-      default='trained_models/kws_model.tflite',
+      default='trained_models/kws_ref_model_float32.tflite',
       help='File name to which the TF Lite model will be saved (quantize.py) or loaded (eval_quantized_model)')
   parser.add_argument(
       '--learning_rate',

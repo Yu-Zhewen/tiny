@@ -1,41 +1,14 @@
-'''
-MLCommons
-group: TinyMLPerf (https://github.com/mlcommons/tiny)
-
-image classification on cifar10
-
-onnx_test.py: converted models performances on cifar10 test set
-'''
-
-import tensorflow as tf
-import numpy as np
-import h5py
 import os
-import sys
-import train
-import eval_functions_eembc
-from sklearn.metrics import roc_auc_score
-import keras_model
 import onnx
 import onnxruntime
 import pickle
+import numpy as np
+import tensorflow as tf
 
-np.set_printoptions(threshold=sys.maxsize)
+BASE_DIR = os.path.join(os.getcwd(), 'vw_coco2014_96')
 
-# if True uses the official MLPerf Tiny subset of CIFAR10 for validation
-# if False uses the full CIFAR10 validation set
-PERF_SAMPLE = True
-# if True uses quantized model
-QUANT_MODEL = True
-# if True gathers activation sparsity
+QUANT_MODEL = False
 LOG_SPARSITY = True
-
-if QUANT_MODEL:
-    _name = keras_model.get_quant_model_name()
-    model_path = 'trained_models/' + _name + '_quant.onnx'
-else:
-    _name = keras_model.get_quant_model_name()
-    model_path = 'trained_models/' + _name + '.onnx'
 
 class SparsityLogger:
     def __init__(self, conv_inputs):
@@ -52,8 +25,29 @@ class SparsityLogger:
         self.samp_counter += 1
 
 if __name__ == '__main__':
-    # Load the ONNX model.
-    model = onnx.load(model_path)
+    datagen = tf.keras.preprocessing.image.ImageDataGenerator(
+      rotation_range=10,
+      width_shift_range=0.05,
+      height_shift_range=0.05,
+      zoom_range=.1,
+      horizontal_flip=True,
+      validation_split=0.1,
+      rescale=1. / 255)
+
+    val_generator = datagen.flow_from_directory(
+      BASE_DIR,
+      target_size=(96, 96),
+      batch_size=1,
+      subset='validation',
+      color_mode='rgb')
+
+    _name = "vww_96"
+    if QUANT_MODEL:
+        onnx_file_name = "trained_models/" + _name + "_int8.onnx"
+    else:
+        onnx_file_name = "trained_models/" + _name + "_float.onnx"
+
+    model = onnx.load(onnx_file_name)
     model.graph.input[0].type.tensor_type.shape.dim[0].dim_value = 1 # batch size
     model.graph.output[0].type.tensor_type.shape.dim[0].dim_value = 1
     model.graph.ClearField('value_info')
@@ -86,43 +80,36 @@ if __name__ == '__main__':
             i = _find_act_input(model, node)
             conv_inputs[node.name] = i
 
-    cifar_10_dir = 'cifar-10-batches-py'
-
-    train_data, train_filenames, train_labels, test_imgs, test_filenames, test_labels, label_names = \
-        train.load_cifar_10_data(cifar_10_dir)
-
-    if PERF_SAMPLE:
-        _idxs = np.load('perf_samples_idxs.npy')
-        test_imgs = test_imgs[_idxs]
-        test_labels = test_labels[_idxs]
-        test_filenames = test_filenames[_idxs]
-
-    label_classes = np.argmax(test_labels, axis=1)
-    print("Label classes: ", label_classes.shape)
-
-    if QUANT_MODEL:
-        test_imgs = test_imgs.astype(np.int64) - 128
-        test_imgs = test_imgs.astype(np.int8)
-    else:
-        test_imgs = test_imgs.astype(np.float32)
+    output_data = []
+    labels = []
 
     if LOG_SPARSITY:
         sparsity_logger = SparsityLogger(conv_inputs)
-
     assert len(pred_names) == 1
     pred_name = pred_names[0]
     pred_idx = output_names.index(pred_name)
-    predictions = []
-    for img in test_imgs:
-        input_data = img.reshape(1, 32, 32, 3)
+
+    for i, (dat, label) in enumerate(val_generator):
+        if i >= val_generator.n:
+            break
+        if QUANT_MODEL:
+            input_scale = 0.003921568859368563
+            input_zero_point = -128
+            dat_q = np.array(dat/input_scale + input_zero_point, dtype=np.int8)
+            input_data = dat_q
+        else:
+            input_data = dat
         input_data = input_data.transpose((0, 3, 1, 2))
+
         assert len(input_names) == 1
         inputs = {input_names[0]: input_data}
         outputs = sess.run(output_names, inputs)
         if LOG_SPARSITY:
             sparsity_logger.update(output_names, outputs)
-        predictions.append(outputs[pred_idx].reshape(10,))
-    predictions = np.array(predictions)
+        # The function `get_tensor()` returns a copy of the tensor data.
+        # Use `tensor()` in order to get a pointer to the tensor.
+        output_data.append(np.argmax(outputs[pred_idx]))
+        labels.append(label[0][1])
 
     if LOG_SPARSITY:
         if QUANT_MODEL:
@@ -130,15 +117,7 @@ if __name__ == '__main__':
         else:
             pickle.dump(sparsity_logger.ma_meter, open(f'trained_models/{_name}_sparsity.pkl', 'wb'))
 
-    print("EEMBC calculate_accuracy method")
-    accuracy_eembc = eval_functions_eembc.calculate_accuracy(predictions, label_classes)
-    print("---------------------")
+    num_correct = np.sum(np.array(labels) == output_data)
+    acc = num_correct / len(labels)
 
-    auc_scikit = roc_auc_score(test_labels, predictions)
-    print("sklearn.metrics.roc_auc_score method")
-    print("AUC sklearn: ", auc_scikit)
-    print("---------------------")
-
-    print("EEMBC calculate_auc method")
-    auc_eembc = eval_functions_eembc.calculate_auc(predictions, label_classes, label_names, model_path)
-    print("---------------------")
+    print(f"Accuracy = {acc:5.3f} ({num_correct}/{len(labels)})")
